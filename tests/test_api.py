@@ -225,16 +225,36 @@ def test_snapshot_pinned_at_generation_start_with_interleaved_replace(client):
     # 固定的是生成开始时的 v1 快照，而不是后来的 v2
     assert gen["old_version"] == old_v1["version"]
     assert gen["new_version"] == new_v1["version"]
+    # 首次生成、此前无发布结果 -> 照常自动发布
+    assert gen["review_status"] == "none"
     result = client.get("/result").json()
     assert result["old_version"]["version"] == old_v1["version"]
     assert result["new_version"]["version"] == new_v1["version"]
     assert result["total_households"] == 18
 
-    # 再生成一次才使用新快照
-    gen_b = poll_generation(client, client.post("/generations").json()["id"])
+    # 再生成一次才使用新快照；旧网格编号整体变化 -> 暂存为待核候选
+    r_b = client.post("/generations")
+    gen_b = poll_generation(client, r_b.json()["id"])
     assert gen_b["old_version"] == old_v2["version"]
     assert gen_b["new_version"] == new_v2["version"]
+    assert gen_b["review_status"] == "pending"
+    assert gen_b["baseline_generation"] == gen["id"]
+    assert {r["type"] for r in gen_b["review_reasons"]} >= {
+        "cell_added",
+        "cell_removed",
+    }
+    # 核准前当前结果保持上一份
+    assert client.get("/result").json()["generation_id"] == gen["id"]
+    # 候选完整结果可查
+    cand = client.get(f"/generations/{gen_b['id']}/result").json()
+    assert cand["review_status"] == "pending"
+    assert cand["total_households"] == 100
+    # 核准后原子切换
+    appr = client.post(f"/generations/{gen_b['id']}/approval")
+    assert appr.status_code == 200, appr.text
+    assert appr.json()["review_status"] == "approved"
     result_b = client.get("/result").json()
+    assert result_b["generation_id"] == gen_b["id"]
     assert result_b["total_households"] == 100
     assert [d["district_id"] for d in result_b["districts"]] == ["e1"]
 
@@ -262,7 +282,14 @@ def test_two_generations_serialize_and_both_keep_snapshots(client):
         old_v2["version"],
         new_v2["version"],
     )
-    # 最终当前结果来自后完成发布的 g2
+    # g2 的旧网格相对 g1 的发布有编号变化 -> 待核候选，不会自动顶掉 g1 的发布
+    assert g2["review_status"] == "pending"
+    assert g2["baseline_generation"] == id1
+    assert client.get("/result").json()["generation_id"] == id1
+    # 核准后当前结果才切换到 g2
+    appr = client.post(f"/generations/{id2}/approval")
+    assert appr.status_code == 200, appr.text
+    assert appr.json()["already_approved"] is False
     result = client.get("/result").json()
     assert result["generation_id"] == id2
     assert result["total_households"] == 3

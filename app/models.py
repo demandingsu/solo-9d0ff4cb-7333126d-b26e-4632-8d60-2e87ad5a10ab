@@ -127,6 +127,9 @@ class DistrictSummaryOut(BaseModel):
     detail: list[AllocationOut]
 
 
+ReviewStatus = Literal["none", "pending", "approved", "superseded"]
+
+
 class GenerationOut(BaseModel):
     """生成任务视图。"""
 
@@ -138,6 +141,24 @@ class GenerationOut(BaseModel):
     created_at: str
     started_at: str | None
     finished_at: str | None
+    # 创建任务时固定的当前发布任务（无发布结果时为 None）
+    baseline_generation: int | None = None
+    # 待核状态：none=无待核（自动发布/未计算）；pending=待核候选；
+    # approved=已核准并发布；superseded=已被其他任务发布取代的过期候选
+    review_status: ReviewStatus = "none"
+    review_reasons: list[dict] | None = None
+
+
+class ApprovalOut(BaseModel):
+    """核准结果视图。"""
+
+    generation_id: int
+    review_status: ReviewStatus
+    already_approved: bool
+    current_generation_id: int
+    published_at: str
+    total_households: int
+    review_reasons: list[dict] | None = None
 
 
 class CurrentResultOut(BaseModel):
@@ -149,6 +170,19 @@ class CurrentResultOut(BaseModel):
     old_version: VersionOut
     new_version: VersionOut
     districts: list[DistrictSummaryOut]
+
+
+class CandidateResultOut(BaseModel):
+    """待核候选的完整暂存结果，附待核状态与触发原因（尚未发布，无发布时间）。"""
+
+    generation_id: int
+    published_at: str | None = None
+    total_households: int
+    old_version: VersionOut
+    new_version: VersionOut
+    districts: list[DistrictSummaryOut]
+    review_status: ReviewStatus
+    review_reasons: list[dict] | None = None
 
 
 class HealthOut(BaseModel):

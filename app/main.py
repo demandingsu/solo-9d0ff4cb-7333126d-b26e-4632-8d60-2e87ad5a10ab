@@ -11,11 +11,14 @@ from sqlite3 import Connection
 from . import db
 from .config import DB_PATH, WORKER_THREADS
 from .models import (
+    ApprovalOut,
+    CandidateResultOut,
     CurrentResultOut,
     GenerationOut,
     HealthOut,
     NewDistrictSubmission,
     OldGridSubmission,
+    ReviewStatus,
     VersionOut,
 )
 
@@ -40,9 +43,10 @@ app = FastAPI(
     description=(
         "整版提交旧网格（编号、整数矩形、户数）与新片区（编号、整数矩形），"
         "按重叠面积以最大余数法逐格分摊户数并守恒总户数。"
-        "生成任务固定提交时刻的版本快照，生成期间可继续替换任一输入。"
+        "生成任务固定提交时刻的版本快照与当前发布任务；可疑旧网格修订的结果"
+        "暂存为待核候选，统计员核准后才原子切换供数结果。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -133,9 +137,13 @@ def get_version(
     tags=["生成任务"],
 )
 def create_generation(conn: Connection = Depends(get_db)):
-    """开始一次生成：同步固定当前最新 old/new 版本快照，计算在后台串行执行。
+    """开始一次生成：同步固定当前最新 old/new 版本快照与当前发布任务，后台串行计算。
 
-    快照在本请求的事务内确定；此后替换任一输入不影响本任务。
+    - 快照与比较基准在本请求事务内确定；此后替换任一输入不影响本任务；
+    - 计算后若发现相对基准发布的可疑旧网格修订（编号/矩形变化，或同格户数
+      相对变化超过 30%、零值变非零），完整结果暂存为待核候选（review_status=pending），
+      触发原因可在任务详情中查询，等待人工核准；
+    - 尚无发布结果，或无可疑变化时，任务完成即自动发布。
     """
     try:
         with conn:
@@ -148,8 +156,15 @@ def create_generation(conn: Connection = Depends(get_db)):
 
 
 @app.get("/generations", response_model=list[GenerationOut], tags=["生成任务"])
-def list_generations(conn: Connection = Depends(get_db)):
-    return db.list_generations(conn)
+def list_generations(
+    review_status: ReviewStatus | None = Query(
+        None,
+        description="按待核状态过滤：pending=待核候选、approved=已核准、superseded=过期、none=无待核",
+    ),
+    conn: Connection = Depends(get_db),
+):
+    """列出全部生成任务，可按待核状态过滤（如 review_status=pending 查待核候选）。"""
+    return db.list_generations(conn, review_status)
 
 
 @app.get("/generations/{gen_id}", response_model=GenerationOut, tags=["生成任务"])
@@ -160,6 +175,52 @@ def get_generation(
     if row is None:
         raise HTTPException(status_code=404, detail=f"生成任务 {gen_id} 不存在")
     return row
+
+
+@app.post(
+    "/generations/{gen_id}/approval",
+    response_model=ApprovalOut,
+    tags=["待核核准"],
+)
+def approve_generation(
+    gen_id: int = PathParam(..., ge=1), conn: Connection = Depends(get_db)
+):
+    """统计员核准待核候选。
+
+    仅当比较基准仍是当前发布、且任务计算成功时，才在单事务内原子切换供数结果；
+    期间已有其他任务发布则拒绝过期核准；重复核准不重复写入（幂等）。
+    """
+    try:
+        return db.approve_generation(gen_id, conn)
+    except db.ReviewError as exc:
+        message = str(exc)
+        status = 404 if "不存在" in message else 409
+        raise HTTPException(status_code=status, detail=message)
+
+
+@app.get(
+    "/generations/{gen_id}/result",
+    response_model=CandidateResultOut,
+    tags=["待核核准"],
+)
+def get_generation_result(
+    gen_id: int = PathParam(..., ge=1), conn: Connection = Depends(get_db)
+):
+    """查询任意任务的完整结果；待核候选附待核状态与触发原因。
+
+    任务不存在或计算未成功（无暂存明细）时返回 404/409。
+    """
+    row = db.get_generation(gen_id, conn)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"生成任务 {gen_id} 不存在")
+    if row["status"] != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail=f"任务 {gen_id} 计算未成功（状态 {row['status']}），暂无结果",
+        )
+    result = db.get_candidate_result(gen_id, conn)
+    assert result is not None
+    return result
 
 
 @app.get("/result", response_model=CurrentResultOut, tags=["发布结果"])
